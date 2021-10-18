@@ -1,0 +1,190 @@
+name: Terraform ChatOps
+on: [issue_comment]
+
+jobs:
+  terraform-chatops-parser:
+    runs-on: ubuntu-latest
+    steps:
+    # Sets up the Chatops functionality for listening to PR comments in the REPO
+      - name: Setup
+        id: prcommentparser
+        uses: machine-learning-apps/actions-chatops@master
+        with:
+          TRIGGER_PHRASE: "/terraform"
+        env: # you must supply GITHUB_TOKEN
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # Parse Parameters from Terraform Commands entered as comments in PR 
+    # And set them as output variables to be used by all subsequent jobs.
+      - name: Parse Terraform PR Commands for use by terraform-executor job
+        id: parsetfcmds
+        run: |
+          #!/bin/bash 
+          
+          # Parse Terraform PR Comment
+          TF_COMMAND_PARAMS="${{ steps.prcommentparser.outputs.TRAILING_LINE }}"
+          TERRAFORM_OPERATION=$(echo $TF_COMMAND_PARAMS | awk '{print $1}')
+          TERRAFORM_ENVIRONMENT=$(echo $TF_COMMAND_PARAMS | awk '{print $2}')
+
+          # Validate TF_ENV and TERRAFORM_OPERATION specified in PR comments
+          if [[ $TERRAFORM_ENVIRONMENT != "staging" && $TERRAFORM_ENVIRONMENT != "prod" ]]; then
+            echo "Invalid Terraform Environment specified in the PR's Terraform Command. Env can be either 'prod' or 'staging' only."
+            exit 1
+          elif [[ $TERRAFORM_OPERATION != "apply" && $TERRAFORM_OPERATION != "plan" ]]; then
+            echo "Invalid Terraform Command specified in the PR's Terraform Command. Operation can be either 'plan' or 'apply' only."
+            exit 1
+          fi
+
+          # Pass on Terraform Command Variables to other Steps in the same job
+          echo "::set-output name=TERRAFORM_OPERATION::$(echo $TERRAFORM_OPERATION)"
+          echo "::set-output name=TERRAFORM_ENVIRONMENT::$(echo $TERRAFORM_ENVIRONMENT)"
+    
+    # Set Job level ouput variables after parsing Terraform Commands. These variables can be used by other jobs 
+    outputs:
+      TERRAFORM_PR_TRIGGER: ${{ steps.prcommentparser.outputs.BOOL_TRIGGERED }}
+      TERRAFORM_PR_SHA: ${{ steps.prcommentparser.outputs.SHA }}
+      TERRAFORM_OPERATION: ${{ steps.parsetfcmds.outputs.TERRAFORM_OPERATION }}
+      TERRAFORM_ENVIRONMENT: ${{ steps.parsetfcmds.outputs.TERRAFORM_ENVIRONMENT }}
+
+  terraform-chatops-executor:
+    runs-on: ubuntu-latest
+    needs: terraform-chatops-parser
+    environment:
+      name: ${{ needs.terraform-chatops-parser.outputs.TERRAFORM_ENVIRONMENT }}
+    env:
+      TERRAFORM_DIR: ${{ github.workspace }}/devops/terraform
+      TERRAFORM_PR_TRIGGER: ${{ needs.terraform-chatops-parser.outputs.TERRAFORM_PR_TRIGGER }}
+      TERRAFORM_PR_SHA: ${{ needs.terraform-chatops-parser.outputs.TERRAFORM_PR_SHA }}
+      TERRAFORM_ENVIRONMENT: ${{ needs.terraform-chatops-parser.outputs.TERRAFORM_ENVIRONMENT }}
+      TERRAFORM_OPERATION: ${{ needs.terraform-chatops-parser.outputs.TERRAFORM_OPERATION }}
+      GH_USER_NAME: ${{ secrets.GH_USER_NAME }}
+      GH_USER_PAT: ${{ secrets.GH_USER_PAT }}
+      EXPAND_SUMMARY_DETAILS: "false"
+    
+    steps:
+    # Clones the branch of the PR associated with the triggering phrase, but only if it is triggered.
+      - name: Clone Branch of PR
+        id: clonerepo
+        if: ${{ env.TERRAFORM_PR_TRIGGER }} == 'true'
+        uses: actions/checkout@master
+        with:
+          ref: ${{ env.TERRAFORM_PR_SHA }}
+      
+      - name: test patload
+        run: |
+          cat $GITHUB_EVENT_PATH
+
+    # Setup Terraform Binary in Runner
+      - uses: hashicorp/setup-terraform@v1
+        with:
+          terraform_version: 0.13.5
+    
+    # Configure the Runner's github client with User's Personal Access Token 
+    # To enable terraform provider to pull private Terraform Modules (during terraform init) across SavvasLearning Organization. 
+      - name: Configure Github PAT in Runner for pulling Private Terraform Modules
+        run: |
+          git config --local --remove-section http."https://github.com/"
+          git config --global url."https://${GH_USER_NAME}:${GH_USER_PAT}@github.com/SavvasLearning".insteadOf "https://github.com/SavvasLearning"
+    
+    # Setup AWS profiles in the Runner's ~/.aws/config file 
+    # These profiles are used by the Terraform Scripts to perform CRUD operations on AWS infrastructure.
+      - name: Configure AWS Profiles in Runner
+        id: awsprofilesetup
+        run: |
+          #!/bin/bash 
+          TERRAFORM_ENVIRONMENT=${{ env.TERRAFORM_ENVIRONMENT }}
+
+          # Check environment and get appropriate AWS secret from REPO
+          if [[ $TERRAFORM_ENVIRONMENT == "staging" || $TERRAFORM_ENVIRONMENT == "nightly" ]]; then
+            echo "ENV IS STAGE"
+            AWS_ACCESS_KEY_ID=${{ secrets.PREPROD_AWS_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY=${{ secrets.PREPROD_AWS_SECRET_ACCESS_KEY }}
+            echo $AWS_ACCESS_KEY_ID
+          elif [[ $TERRAFORM_ENVIRONMENT == "prod" ]]; then
+            echo "ENV IS PROD"
+            AWS_ACCESS_KEY_ID=${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY=${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+          else
+            echo "No AWS Credentials found in repo for specified environment"
+          fi
+
+          # Create AWS Config file in the runner with appropriate AWS Env credentials
+          AWS_CREDENTIAL_CONFIG_FILE=~/.aws/config && mkdir $(dirname ${AWS_CREDENTIAL_CONFIG_FILE}) && touch $AWS_CREDENTIAL_CONFIG_FILE
+          cat << EOF >> $AWS_CREDENTIAL_CONFIG_FILE
+          [profile devops_tools]
+          aws_access_key_id=${{ secrets.DEVOPS_TOOLS_AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key=${{ secrets.DEVOPS_TOOLS_AWS_SECRET_ACCESS_KEY }}
+          [profile ${{ github.event.repository.name }}-nightly]
+          aws_access_key_id=$AWS_ACCESS_KEY_ID
+          aws_secret_access_key=$AWS_SECRET_ACCESS_KEY
+          EOF
+
+      # Based on the TERRAFORM_ENVIRONMENT set -  working directory is set to execute terraform init
+      # And terraform init command is executed here. 
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}/${{ env.TERRAFORM_ENVIRONMENT }}
+        id: terraform_init
+        run: |
+          terraform init
+
+      # Based on the TERRAFORM_ENVIRONMENT set -  working directory is set to execute terraform plan
+      # And terraform plan command is executed here.
+      - name: Terraform Plan
+        #if: ${{ env.TERRAFORM_OPERATION == 'plan' }}
+        working-directory: ${{ env.TERRAFORM_DIR }}/${{ env.TERRAFORM_ENVIRONMENT }}
+        id: terraform_plan
+        run: |
+          terraform plan -no-color
+        continue-on-error: true
+
+      - name: Comment on PR with Terraform Plan
+        if: ${{ env.TERRAFORM_OPERATION == 'plan' }} 
+        uses: actions/github-script@0.9.0
+        env:
+          PLAN: "terraform\n${{ steps.terraform_plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Plan 🗒\`${{ steps.terraform_apply.outcome }}\`
+            <details><summary>Show Plan Output</summary>
+            \`\`\`${process.env.PLAN}\`\`\`
+            </details>
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+          
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      # Based on the TERRAFORM_ENVIRONMENT set -  working directory is set to execute terraform apply
+      # And terraform apply command is executed here.
+      - name: Terraform Auto Apply
+        if: ${{ env.TERRAFORM_OPERATION == 'apply' }} 
+        working-directory: ${{ env.TERRAFORM_DIR }}/${{ env.TERRAFORM_ENVIRONMENT }}
+        id: terraform_apply
+        run: |
+          terraform apply -auto-approve -no-color
+        continue-on-error: true
+
+      - name: Comment on PR with Terraform Apply
+        if: ${{ env.TERRAFORM_OPERATION == 'apply' }} 
+        uses: actions/github-script@0.9.0
+        env:
+          APPLY: "terraform\n${{ steps.terraform_apply.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Apply 🚀\`${{ steps.terraform_apply.outcome }}\`
+            <details><summary>Show Apply Output</summary>
+            \`\`\`${process.env.APPLY}\`\`\`
+            </details>
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+          
+            github.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
